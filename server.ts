@@ -113,62 +113,6 @@ async function ensureFonts() {
   }
 }
 
-// Google Drive Configuration
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI || `${process.env.APP_URL}/api/auth/google/callback`
-);
-
-if (process.env.GOOGLE_REFRESH_TOKEN) {
-  oauth2Client.setCredentials({
-    refresh_token: process.env.GOOGLE_REFRESH_TOKEN
-  });
-}
-
-const drive = google.drive({ version: 'v3', auth: oauth2Client });
-
-async function uploadToDrive(filePath: string, fileName: string, mimeType: string) {
-  if (!process.env.GOOGLE_REFRESH_TOKEN) {
-    console.warn("Google Drive refresh token missing. Skipping Drive upload.");
-    return null;
-  }
-
-  try {
-    const fileMetadata = {
-      name: fileName,
-      parents: process.env.GOOGLE_DRIVE_FOLDER_ID ? [process.env.GOOGLE_DRIVE_FOLDER_ID] : []
-    };
-    const media = {
-      mimeType: mimeType,
-      body: fs.createReadStream(filePath)
-    };
-    const response = await drive.files.create({
-      requestBody: fileMetadata,
-      media: media,
-      fields: 'id, webViewLink, webContentLink'
-    });
-    console.log("File uploaded to Google Drive:", response.data.id);
-    return response.data;
-  } catch (error) {
-    console.error("Error uploading to Google Drive:", error);
-    return null;
-  }
-}
-
-async function getFileFromDrive(fileId: string) {
-  try {
-    const response = await drive.files.get({
-      fileId: fileId,
-      alt: 'media'
-    }, { responseType: 'stream' });
-    return response.data;
-  } catch (error) {
-    console.error("Error getting file from Google Drive:", error);
-    return null;
-  }
-}
-
 async function ensureFileOnDisk(filePath: string): Promise<string | null> {
   const absolutePath = path.join(__dirname, filePath.startsWith('/') ? filePath.slice(1) : filePath);
   if (fs.existsSync(absolutePath)) return absolutePath;
@@ -178,16 +122,6 @@ async function ensureFileOnDisk(filePath: string): Promise<string | null> {
     if (!db) await connectToMongo();
     const fileRecord = await db.collection("files").findOne({ filename });
     if (fileRecord) {
-      if (fileRecord.driveId) {
-        const driveStream = await getFileFromDrive(fileRecord.driveId);
-        if (driveStream) {
-          const writeStream = fs.createWriteStream(absolutePath);
-          await new Promise<void>((resolve, reject) => {
-            driveStream.pipe(writeStream).on('finish', () => resolve()).on('error', reject);
-          });
-          return absolutePath;
-        }
-      }
       if (fileRecord.data) {
         fs.writeFileSync(absolutePath, fileRecord.data.buffer);
         return absolutePath;
@@ -349,33 +283,8 @@ async function startServer() {
     res.redirect(`${process.env.APP_URL || ''}/status/${id}?party=${party}`);
   });
 
-  // Google Drive Auth Routes
-  app.get("/api/auth/google", (req, res) => {
-    const url = oauth2Client.generateAuthUrl({
-      access_type: 'offline',
-      scope: ['https://www.googleapis.com/auth/drive.file'],
-      prompt: 'consent'
-    });
-    res.redirect(url);
-  });
 
-  app.get("/api/auth/google/callback", async (req, res) => {
-    const { code } = req.query;
-    try {
-      const { tokens } = await oauth2Client.getToken(code as string);
-      console.log("Google Drive Tokens:", tokens);
-      res.send(`
-        <h1>Google Drive Authenticated</h1>
-        <p>Refresh Token: <code>${tokens.refresh_token}</code></p>
-        <p>Please add this to your GOOGLE_REFRESH_TOKEN environment variable in AI Studio.</p>
-      `);
-    } catch (error: any) {
-      console.error("Error getting Google tokens:", error);
-      res.status(500).send("Authentication failed");
-    }
-  });
-
-  // File Retrieval Route with Google Drive & MongoDB fallback
+  // File Retrieval Route with MongoDB fallback
   app.get("/uploads/:filename", async (req, res) => {
     const { filename } = req.params;
     const localPath = path.join(uploadsDir, filename);
@@ -385,30 +294,17 @@ async function startServer() {
       return res.sendFile(localPath);
     }
 
-    // 2. Fallback to Google Drive or MongoDB
+    // 2. Fallback to MongoDB
     try {
       if (!db) await connectToMongo();
       if (db) {
         const fileRecord = await db.collection("files").findOne({ filename });
         
-        if (fileRecord) {
-          // Try Google Drive first if we have an ID
-          if (fileRecord.driveId) {
-            const driveStream = await getFileFromDrive(fileRecord.driveId);
-            if (driveStream) {
-              const writeStream = fs.createWriteStream(localPath);
-              driveStream.pipe(writeStream);
-              res.contentType(fileRecord.mimeType);
-              return driveStream.pipe(res);
-            }
-          }
-          
-          // Fallback to MongoDB buffer if Drive fails or no Drive ID
-          if (fileRecord.data) {
-            fs.writeFileSync(localPath, fileRecord.data.buffer);
-            res.contentType(fileRecord.mimeType);
-            return res.send(fileRecord.data.buffer);
-          }
+        if (fileRecord && fileRecord.data) {
+          // Cache locally for future requests
+          fs.writeFileSync(localPath, fileRecord.data.buffer);
+          res.contentType(fileRecord.mimeType || 'application/octet-stream');
+          return res.send(fileRecord.data.buffer);
         }
       }
     } catch (error) {
@@ -449,28 +345,28 @@ async function startServer() {
     if (!req.file) return res.status(400).json({ error: "לא נבחר קובץ להעלאה" });
     
     try {
-      // 1. Upload to Google Drive
-      const driveFile = await uploadToDrive(req.file.path, req.file.filename, req.file.mimetype);
-      
-      // 2. Store metadata in MongoDB (Text data stays in MongoDB, files go to Drive)
+      // Save to MongoDB
       if (db) {
-        await db.collection("files").insertOne({
-          filename: req.file.filename,
-          mimeType: req.file.mimetype,
-          // We no longer store the buffer in MongoDB to save space and follow the Drive-first policy
-          driveId: driveFile?.id,
-          driveLink: driveFile?.webViewLink,
-          created_at: new Date()
-        });
+        const fileBuffer = fs.readFileSync(req.file.path);
+        await db.collection("files").updateOne(
+          { filename: req.file.filename },
+          { 
+            $set: { 
+              filename: req.file.filename,
+              originalName: req.file.originalname,
+              mimeType: req.file.mimetype,
+              data: fileBuffer,
+              uploadedAt: new Date()
+            } 
+          },
+          { upsert: true }
+        );
       }
-      
-      res.json({ 
-        path: `/uploads/${req.file.filename}`,
-        driveId: driveFile?.id
-      });
+
+      res.json({ path: `/uploads/${req.file.filename}` });
     } catch (error: any) {
-      console.error("Error saving file:", error);
-      res.json({ path: `/uploads/${req.file!.filename}` });
+      console.error("Upload error:", error);
+      res.status(500).json({ error: "שגיאה בשמירת הקובץ במסד הנתונים" });
     }
   });
 

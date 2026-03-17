@@ -1887,7 +1887,7 @@ ${statusLink}
     }
 
     const encodedMessage = encodeURIComponent(whatsAppFormData.message);
-    const whatsappUrl = `https://api.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
+    const whatsappUrl = `https://web.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
     
     // Log the action
     try {
@@ -2873,6 +2873,22 @@ ${shortPublicUrl}
     }
   };
 
+  const getRedemptionStatus = (dateStr?: string) => {
+    if (!dateStr) return null;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const redemptionDate = new Date(dateStr);
+    redemptionDate.setHours(0, 0, 0, 0);
+    
+    const diffTime = redemptionDate.getTime() - today.getTime();
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    return {
+      days: diffDays,
+      color: diffDays < 14 ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-700'
+    };
+  };
+
   if (isQuestionnaireView) {
     return (
       <div className="min-h-screen bg-slate-50 p-4 font-sans" dir="rtl">
@@ -3780,6 +3796,7 @@ ${shortPublicUrl}
                         {sortBy.field === 'estimated_processing_days' && (sortBy.direction === 'asc' ? <ChevronRight size={14} className="rotate-90" /> : <ChevronRight size={14} className="-rotate-90" />)}
                       </div>
                     </th>
+                    <th className="px-2 py-1 text-sm font-bold text-slate-700">פדיון צ'ק</th>
                     <th className="px-2 py-1 text-sm font-bold text-slate-700">פעולות</th>
                   </tr>
                 </thead>
@@ -3925,6 +3942,17 @@ ${shortPublicUrl}
                             })()}
                           </span>
                         </div>
+                      </td>
+                      <td className="px-2 py-1">
+                        {(() => {
+                          const status = getRedemptionStatus(claim.check_redemption_date);
+                          if (!status) return <span className="text-slate-300">-</span>;
+                          return (
+                            <div className={`px-2 py-0.5 rounded-full text-[10px] font-bold text-center ${status.color}`}>
+                              {status.days} ימים
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td className="px-2 py-1" onClick={(e) => e.stopPropagation()}>
                         <div className="flex gap-1">
@@ -4233,6 +4261,15 @@ ${shortPublicUrl}
                                   <input placeholder="שם..." type="text" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-xl outline-none bg-white" value={formData.tp_insured_name || ''} onChange={(e) => setFormData({...formData, tp_insured_name: e.target.value})} />
                                   <input placeholder="מספר רכב..." type="text" className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-xl outline-none font-mono bg-white" value={formData.tp_car_number || ''} onChange={(e) => setFormData({...formData, tp_car_number: e.target.value})} />
                                 </div>
+                              </div>
+                              <div className="space-y-1">
+                                <label className={`text-[10px] font-bold ${isTPClaim ? 'text-yellow-700' : 'text-sky-700'} uppercase`}>תאריך פדיון צ'ק</label>
+                                <input 
+                                  type="date" 
+                                  className="w-full px-3 py-1.5 text-sm border border-slate-200 rounded-xl outline-none bg-white" 
+                                  value={formData.check_redemption_date || ''} 
+                                  onChange={(e) => setFormData({...formData, check_redemption_date: e.target.value})} 
+                                />
                               </div>
                             </div>
                           )}
