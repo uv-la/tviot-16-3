@@ -119,6 +119,12 @@ async function ensureFonts() {
 async function ensureFileOnDisk(filePath: string): Promise<string | null> {
   const normalized = filePath.startsWith("/") ? filePath.slice(1) : filePath;
   const absolutePath = path.join(__dirname, normalized);
+  console.log("[uploads] ensureFileOnDisk", {
+    requested: filePath,
+    normalized,
+    absolutePath,
+    existsOnDisk: fs.existsSync(absolutePath),
+  });
   if (fs.existsSync(absolutePath)) return absolutePath;
 
   const filename = path.basename(filePath);
@@ -126,8 +132,13 @@ async function ensureFileOnDisk(filePath: string): Promise<string | null> {
     if (!db) await connectToMongo();
     const fileRecord = await db?.collection("files").findOne({ filename });
     if (fileRecord?.driveFileId) {
+      console.log("[uploads] file not on disk, downloading from Drive", {
+        filename,
+        driveFileId: fileRecord.driveFileId,
+      });
       const tempPath = path.join(uploadsDir, `_tmp_${nanoid()}${path.extname(filename)}`);
       const ok = await downloadFromDriveToFile(fileRecord.driveFileId, tempPath);
+      console.log("[uploads] download result", { filename, tempPath, ok });
       if (ok) return tempPath;
     }
   } catch (error) {
@@ -140,12 +151,15 @@ async function ensureFileOnDisk(filePath: string): Promise<string | null> {
 const driveFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 const driveClientId = process.env.GOOGLE_CLIENT_ID;
 const driveClientSecret = process.env.GOOGLE_CLIENT_SECRET;
-const driveRedirectUri = process.env.GOOGLE_REDIRECT_URI || `${process.env.APP_URL || "http://localhost:3000"}/api/drive/callback`;
+// IMPORTANT: do not fall back to localhost in production. Render must provide APP_URL/GOOGLE_REDIRECT_URI.
+const driveRedirectUri =
+  process.env.GOOGLE_REDIRECT_URI ||
+  (process.env.APP_URL ? `${process.env.APP_URL}/api/drive/callback` : "");
 
 const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"];
 
 function createOAuth2Client() {
-  if (!driveClientId || !driveClientSecret) return null;
+  if (!driveClientId || !driveClientSecret || !driveRedirectUri) return null;
   return new google.auth.OAuth2(driveClientId, driveClientSecret, driveRedirectUri);
 }
 
@@ -182,6 +196,14 @@ async function uploadToDrive(
   const drive = await getDriveClient();
   if (!drive) throw new Error("Google Drive not configured");
   if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+
+  console.log("[drive] uploadToDrive", {
+    localFilePath: filePath,
+    fileName,
+    mimeType,
+    driveFolderId,
+  });
+
   const fileBuffer = fs.readFileSync(filePath);
   const res = await drive.files.create({
     requestBody: {
@@ -222,6 +244,7 @@ async function downloadFromDriveToFile(fileId: string, destPath: string): Promis
   const drive = await getDriveClient();
   if (!drive) return false;
   try {
+    console.log("[drive] downloadFromDriveToFile", { fileId, destPath });
     const fileRes = await drive.files.get(
       { fileId, alt: "media", supportsAllDrives: true },
       { responseType: "stream" }
@@ -450,15 +473,22 @@ async function startServer() {
     
     try {
       const filename = req.file.filename;
+      console.log("[upload] incoming file", {
+        diskStoredPath: req.file.path,
+        diskFilename: req.file.filename,
+        originalName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        driveFolderId,
+        driveRedirectUriConfigured: !!driveRedirectUri,
+      });
 
       // Upload to Google Drive only (no MongoDB file storage)
       const drive = await getDriveClient();
       if (!drive) {
         try { fs.unlinkSync(req.file.path); } catch (_) {}
-        const baseUrl = process.env.APP_URL || "http://localhost:3000";
         return res.status(503).json({
           error: "Google Drive לא מחובר. לחץ לחיבור.",
-          authUrl: `${baseUrl}/api/drive/auth`,
+          authUrl: process.env.APP_URL ? `${process.env.APP_URL}/api/drive/auth` : undefined,
         });
       }
 
@@ -581,7 +611,7 @@ async function startServer() {
           : "Google Drive not configured",
         configured: hasOAuthConfig,
         connected: hasToken,
-        authUrl: hasOAuthConfig && !hasToken ? `${process.env.APP_URL || "http://localhost:3000"}/api/drive/auth` : undefined,
+        authUrl: hasOAuthConfig && !hasToken && process.env.APP_URL ? `${process.env.APP_URL}/api/drive/auth` : undefined,
       });
     }
     try {
