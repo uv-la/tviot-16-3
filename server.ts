@@ -156,7 +156,9 @@ const driveRedirectUri =
   process.env.GOOGLE_REDIRECT_URI ||
   (process.env.APP_URL ? `${process.env.APP_URL}/api/drive/callback` : "");
 
-const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"];
+// NOTE: drive.file can’t always access an existing folder ID (often returns 404).
+// Using full drive scope ensures uploads into a chosen folder work reliably.
+const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"];
 
 function createOAuth2Client() {
   if (!driveClientId || !driveClientSecret || !driveRedirectUri) return null;
