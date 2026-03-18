@@ -2,6 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
+import { Readable } from "stream";
 import multer from "multer";
 import fs from "fs";
 import dns from "dns";
@@ -17,7 +18,9 @@ import "dotenv/config";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+const ai = process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  : null;
 
 const JOTFORM_LINKS: Record<string, string> = {
   'איילון': 'https://form.jotform.com/232780982444060',
@@ -114,23 +117,128 @@ async function ensureFonts() {
 }
 
 async function ensureFileOnDisk(filePath: string): Promise<string | null> {
-  const absolutePath = path.join(__dirname, filePath.startsWith('/') ? filePath.slice(1) : filePath);
+  const normalized = filePath.startsWith("/") ? filePath.slice(1) : filePath;
+  const absolutePath = path.join(__dirname, normalized);
   if (fs.existsSync(absolutePath)) return absolutePath;
 
   const filename = path.basename(filePath);
   try {
     if (!db) await connectToMongo();
-    const fileRecord = await db.collection("files").findOne({ filename });
-    if (fileRecord) {
-      if (fileRecord.data) {
-        fs.writeFileSync(absolutePath, fileRecord.data.buffer);
-        return absolutePath;
-      }
+    const fileRecord = await db?.collection("files").findOne({ filename });
+    if (fileRecord?.driveFileId) {
+      const tempPath = path.join(uploadsDir, `_tmp_${nanoid()}${path.extname(filename)}`);
+      const ok = await downloadFromDriveToFile(fileRecord.driveFileId, tempPath);
+      if (ok) return tempPath;
     }
   } catch (error) {
     console.error("Error ensuring file on disk:", error);
   }
   return null;
+}
+
+// Google Drive Configuration (OAuth2 - works with personal Gmail, no Shared Drive needed)
+const driveFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const driveClientId = process.env.GOOGLE_CLIENT_ID;
+const driveClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const driveRedirectUri = process.env.GOOGLE_REDIRECT_URI || `${process.env.APP_URL || "http://localhost:3000"}/api/drive/callback`;
+
+const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"];
+
+function createOAuth2Client() {
+  if (!driveClientId || !driveClientSecret) return null;
+  return new google.auth.OAuth2(driveClientId, driveClientSecret, driveRedirectUri);
+}
+
+async function getStoredRefreshToken(): Promise<string | null> {
+  try {
+    if (!db) return null;
+    const doc = await db.collection("drive_oauth").findOne({ id: "default" });
+    return doc?.refresh_token || null;
+  } catch {
+    return null;
+  }
+}
+
+async function getDriveClient(): Promise<ReturnType<typeof google.drive> | null> {
+  if (!driveFolderId) return null;
+  try {
+    const oauth2 = createOAuth2Client();
+    if (!oauth2) return null;
+    const refreshToken = await getStoredRefreshToken();
+    if (!refreshToken) return null;
+    oauth2.setCredentials({ refresh_token: refreshToken });
+    return google.drive({ version: "v3", auth: oauth2 });
+  } catch (e) {
+    console.error("Google Drive init error:", e);
+    return null;
+  }
+}
+
+async function uploadToDrive(
+  filePath: string,
+  fileName: string,
+  mimeType: string
+): Promise<string> {
+  const drive = await getDriveClient();
+  if (!drive) throw new Error("Google Drive not configured");
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+  const fileBuffer = fs.readFileSync(filePath);
+  const res = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: [driveFolderId!],
+    },
+    media: {
+      mimeType: mimeType || "application/octet-stream",
+      body: Readable.from(fileBuffer),
+    },
+    fields: "id",
+    supportsAllDrives: true,
+  });
+  const id = res.data.id;
+  if (!id) throw new Error("Drive API returned no file ID");
+  return id;
+}
+
+async function streamFromDrive(fileId: string, res: express.Response, mimeType?: string): Promise<boolean> {
+  const drive = await getDriveClient();
+  if (!drive) return false;
+  try {
+    const fileRes = await drive.files.get(
+      { fileId, alt: "media", supportsAllDrives: true },
+      { responseType: "stream" }
+    );
+    const stream = fileRes.data as any;
+    if (mimeType) res.contentType(mimeType);
+    stream.pipe(res);
+    return true;
+  } catch (e: any) {
+    console.error("Google Drive stream error:", e?.message || e);
+    return false;
+  }
+}
+
+async function downloadFromDriveToFile(fileId: string, destPath: string): Promise<boolean> {
+  const drive = await getDriveClient();
+  if (!drive) return false;
+  try {
+    const fileRes = await drive.files.get(
+      { fileId, alt: "media", supportsAllDrives: true },
+      { responseType: "stream" }
+    );
+    const stream = fileRes.data as NodeJS.ReadableStream;
+    const writeStream = fs.createWriteStream(destPath);
+    await new Promise<void>((resolve, reject) => {
+      stream.on("error", reject);
+      writeStream.on("error", reject);
+      writeStream.on("finish", resolve);
+      stream.pipe(writeStream);
+    });
+    return true;
+  } catch (e: any) {
+    console.error("Google Drive download error:", e?.message || e);
+    return false;
+  }
 }
 
 // MongoDB Configuration
@@ -180,6 +288,7 @@ async function connectToMongo() {
     await db.collection("agents").createIndex({ name: 1 });
     await db.collection("claim_logs").createIndex({ claim_id: 1 });
     await db.collection("questionnaires").createIndex({ id: 1 }, { unique: true });
+    await db.collection("drive_oauth").createIndex({ id: 1 }, { unique: true });
 
     // Ensure default admin exists
     const admin = await db.collection("users").findOne({ username: "admin" });
@@ -227,6 +336,7 @@ async function connectToMongo() {
       await db.collection("agents").insertMany(initialAgents);
       console.log("Initial agents seeded.");
     }
+
   } catch (error) {
     console.error("Failed to connect to MongoDB:", error);
     isDbConnected = false;
@@ -237,7 +347,7 @@ async function startServer() {
   console.log("Starting server initialization...");
   
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || "3000", 10);
 
   // Immediate health check route before any middleware or DB connection
   app.get("/api/ping", (req, res) => {
@@ -246,8 +356,8 @@ async function startServer() {
 
   // Middleware to ensure DB is connected for API routes
   app.use("/api", (req, res, next) => {
-    // Skip check for ping and debug/db
-    if (req.path === "/ping" || req.path === "/debug/db") return next();
+    // Skip check for ping and debug routes
+    if (req.path === "/ping" || req.path === "/debug/db" || req.path === "/debug/drive" || req.path.startsWith("/drive/")) return next();
     
     if (!db || !isDbConnected) {
       console.warn(`[DB Check] Database not connected for request: ${req.originalUrl}`);
@@ -284,27 +394,21 @@ async function startServer() {
   });
 
 
-  // File Retrieval Route with MongoDB fallback
+  // File Retrieval Route: Google Drive only (no MongoDB file storage)
   app.get("/uploads/:filename", async (req, res) => {
     const { filename } = req.params;
-    const localPath = path.join(uploadsDir, filename);
 
-    // 1. Try serving from local disk first
-    if (fs.existsSync(localPath)) {
-      return res.sendFile(localPath);
-    }
-
-    // 2. Fallback to MongoDB
     try {
       if (!db) await connectToMongo();
       if (db) {
         const fileRecord = await db.collection("files").findOne({ filename });
-        
-        if (fileRecord && fileRecord.data) {
-          // Cache locally for future requests
-          fs.writeFileSync(localPath, fileRecord.data.buffer);
-          res.contentType(fileRecord.mimeType || 'application/octet-stream');
-          return res.send(fileRecord.data.buffer);
+        if (fileRecord?.driveFileId) {
+          const ok = await streamFromDrive(
+            fileRecord.driveFileId,
+            res,
+            fileRecord.mimeType || "application/octet-stream"
+          );
+          if (ok) return;
         }
       }
     } catch (error) {
@@ -345,28 +449,52 @@ async function startServer() {
     if (!req.file) return res.status(400).json({ error: "לא נבחר קובץ להעלאה" });
     
     try {
-      // Save to MongoDB
+      const filename = req.file.filename;
+
+      // Upload to Google Drive only (no MongoDB file storage)
+      const drive = await getDriveClient();
+      if (!drive) {
+        try { fs.unlinkSync(req.file.path); } catch (_) {}
+        const baseUrl = process.env.APP_URL || "http://localhost:3000";
+        return res.status(503).json({
+          error: "Google Drive לא מחובר. לחץ לחיבור.",
+          authUrl: `${baseUrl}/api/drive/auth`,
+        });
+      }
+
+      const driveFileId: string = await uploadToDrive(
+        req.file.path,
+        req.file.originalname || filename,
+        req.file.mimetype
+      );
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+
+      console.log("File uploaded to Google Drive:", driveFileId);
+
+      // Save metadata only (driveFileId) - no file binary in MongoDB
       if (db) {
-        const fileBuffer = fs.readFileSync(req.file.path);
         await db.collection("files").updateOne(
-          { filename: req.file.filename },
-          { 
-            $set: { 
-              filename: req.file.filename,
+          { filename },
+          {
+            $set: {
+              filename,
               originalName: req.file.originalname,
               mimeType: req.file.mimetype,
-              data: fileBuffer,
-              uploadedAt: new Date()
-            } 
+              driveFileId,
+              uploadedAt: new Date(),
+            },
           },
           { upsert: true }
         );
       }
 
-      res.json({ path: `/uploads/${req.file.filename}` });
+      res.json({ path: `/uploads/${filename}` });
     } catch (error: any) {
       console.error("Upload error:", error);
-      res.status(500).json({ error: "שגיאה בשמירת הקובץ במסד הנתונים" });
+      const gErr = error?.response?.data?.error;
+      const msg = gErr?.message || error?.message || "שגיאה בהעלאה ל-Google Drive";
+      const details = gErr?.errors?.[0]?.message;
+      res.status(500).json({ error: msg, ...(details && { details }) });
     }
   });
 
@@ -394,6 +522,84 @@ async function startServer() {
       });
     } catch (error: any) {
       res.status(500).json({ status: "error", message: error.message, configured: true });
+    }
+  });
+
+  // Google Drive OAuth - start authorization
+  app.get("/api/drive/auth", (req, res) => {
+    const oauth2 = createOAuth2Client();
+    if (!oauth2 || !driveFolderId) {
+      return res.status(400).json({
+        error: "Google Drive לא מוגדר",
+        hint: "הגדר GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_DRIVE_FOLDER_ID ב-.env"
+      });
+    }
+    const url = oauth2.generateAuthUrl({
+      access_type: "offline",
+      scope: DRIVE_SCOPES,
+      prompt: "consent",
+    });
+    res.redirect(url);
+  });
+
+  // Google Drive OAuth - callback after user authorizes
+  app.get("/api/drive/callback", async (req, res) => {
+    const { code } = req.query;
+    if (!code || typeof code !== "string") {
+      return res.redirect("/?drive_error=no_code");
+    }
+    try {
+      const oauth2 = createOAuth2Client();
+      if (!oauth2) throw new Error("OAuth not configured");
+      const { tokens } = await oauth2.getToken(code);
+      if (!tokens.refresh_token) throw new Error("No refresh token - try revoking app access and re-authorize");
+      if (!db) await connectToMongo();
+      if (db) {
+        await db.collection("drive_oauth").updateOne(
+          { id: "default" },
+          { $set: { refresh_token: tokens.refresh_token, updated_at: new Date() } },
+          { upsert: true }
+        );
+      }
+      res.redirect("/?drive_connected=1");
+    } catch (e: any) {
+      console.error("Drive OAuth callback error:", e);
+      res.redirect(`/?drive_error=${encodeURIComponent(e?.message || "unknown")}`);
+    }
+  });
+
+  // Google Drive connection test
+  app.get("/api/debug/drive", async (req, res) => {
+    const drive = await getDriveClient();
+    if (!drive) {
+      const hasOAuthConfig = !!driveClientId && !!driveClientSecret;
+      const hasToken = !!(await getStoredRefreshToken());
+      return res.json({
+        status: "error",
+        message: hasOAuthConfig && !hasToken
+          ? "לא מחובר - לחץ לחיבור Google Drive"
+          : "Google Drive not configured",
+        configured: hasOAuthConfig,
+        connected: hasToken,
+        authUrl: hasOAuthConfig && !hasToken ? `${process.env.APP_URL || "http://localhost:3000"}/api/drive/auth` : undefined,
+      });
+    }
+    try {
+      const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+      const file = await drive.files.get({ fileId: folderId!, fields: "id,name" });
+      res.json({
+        status: "ok",
+        configured: true,
+        connected: true,
+        folder: { id: file.data.id, name: file.data.name }
+      });
+    } catch (error: any) {
+      res.status(500).json({
+        status: "error",
+        message: error?.message || "Drive API error",
+        configured: true,
+        connected: true,
+      });
     }
   });
 
@@ -805,6 +1011,7 @@ async function startServer() {
     const { field, filePath } = req.body;
 
     try {
+      if (!ai) return res.status(503).json({ error: "GEMINI_API_KEY is not configured. AI extraction is unavailable." });
       if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid ID" });
       
       const absolutePath = await ensureFileOnDisk(filePath);
@@ -813,7 +1020,10 @@ async function startServer() {
       }
 
       const fileBuffer = fs.readFileSync(absolutePath);
-      const base64Data = fileBuffer.toString('base64');
+      const base64Data = fileBuffer.toString("base64");
+      if (absolutePath.includes("_tmp_")) {
+        try { fs.unlinkSync(absolutePath); } catch (_) {}
+      }
       const mimeType = filePath.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg';
 
       let prompt = "";

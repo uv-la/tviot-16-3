@@ -324,6 +324,7 @@ function PublicClaimUpdates({ claimId }: { claimId: string }) {
     const isMultiple = ['appraiser_report_path', 'appraiser_invoice_path', 'appraiser_photos_path', 'garage_invoice_path'].includes(field);
 
     try {
+      let lastUploadError: { error?: string; authUrl?: string } | null = null;
       const uploadPromises = Array.from(files).map(async (file: File) => {
         const formDataUpload = new FormData();
         formDataUpload.append('file', file, file.name);
@@ -335,12 +336,20 @@ function PublicClaimUpdates({ claimId }: { claimId: string }) {
           const data = await uploadRes.json();
           return data.path;
         }
+        const errData = await uploadRes.json().catch(() => ({}));
+        lastUploadError = errData;
         console.error('Individual file upload failed:', file.name);
         return null;
       });
 
       const uploadedPaths = (await Promise.all(uploadPromises)).filter(Boolean) as string[];
-      if (uploadedPaths.length === 0) throw new Error('העלאת הקבצים נכשלה');
+      if (uploadedPaths.length === 0) {
+        if (lastUploadError?.authUrl) {
+          window.open(lastUploadError.authUrl, '_blank');
+          throw new Error('Google Drive לא מחובר. נפתח חלון לחיבור.');
+        }
+        throw new Error(lastUploadError?.error || 'העלאת הקבצים נכשלה');
+      }
 
       const docRes = await fetch(`/api/public/claims/${claimId}/documents?party=${party || ''}`, {
         method: 'PUT',
@@ -1602,6 +1611,7 @@ export default function App() {
     const isMultiple = ['appraiser_report_path', 'appraiser_invoice_path', 'appraiser_photos_path', 'garage_invoice_path'].includes(field);
     
     try {
+      let lastUploadError: { error?: string; authUrl?: string } | null = null;
       const uploadPromises = Array.from(files).map(async (file: File) => {
         const formDataUpload = new FormData();
         formDataUpload.append('file', file, file.name);
@@ -1613,12 +1623,22 @@ export default function App() {
           const data = await response.json();
           return data.path;
         }
+        const errData = await response.json().catch(() => ({}));
+        lastUploadError = errData;
         console.error('Individual file upload failed:', file.name);
         return null;
       });
 
       const uploadedPaths = (await Promise.all(uploadPromises)).filter(Boolean) as string[];
-      if (uploadedPaths.length === 0) return;
+      if (uploadedPaths.length === 0) {
+        if (lastUploadError?.authUrl) {
+          showToast(lastUploadError.error || 'Google Drive לא מחובר', 'error');
+          window.open(lastUploadError.authUrl, '_blank');
+        } else {
+          showToast(lastUploadError?.error || 'העלאת הקבצים נכשלה', 'error');
+        }
+        return;
+      }
 
       let newFormData: any;
       if (isMultiple) {
@@ -2830,6 +2850,7 @@ ${shortPublicUrl}
     if (!files || files.length === 0) return;
     
     showToast('מעלה קבצים...', 'info');
+    let lastUploadError: { error?: string; authUrl?: string } | null = null;
     const uploadPromises = Array.from(files).map(async (file: File) => {
       const formDataUpload = new FormData();
       formDataUpload.append('file', file, file.name);
@@ -2841,13 +2862,21 @@ ${shortPublicUrl}
         const data = await uploadRes.json();
         return { path: data.path, name: file.name };
       }
+      lastUploadError = await uploadRes.json().catch(() => ({})) as { error?: string; authUrl?: string };
       console.error('Individual attachment upload failed:', file.name);
       return null;
     });
 
     const uploadedResults = (await Promise.all(uploadPromises)).filter(Boolean) as {path: string, name: string}[];
     setSubmitAttachments(prev => [...prev, ...uploadedResults]);
-    showToast('הקבצים נוספו בהצלחה', 'success');
+    if (uploadedResults.length === 0 && lastUploadError?.authUrl) {
+      showToast('Google Drive לא מחובר', 'error');
+      window.open(lastUploadError.authUrl, '_blank');
+    } else if (uploadedResults.length > 0) {
+      showToast('הקבצים נוספו בהצלחה', 'success');
+    } else if (lastUploadError?.error) {
+      showToast(lastUploadError.error, 'error');
+    }
   };
 
   const openLogs = (claim: Claim) => {
@@ -3319,7 +3348,7 @@ ${shortPublicUrl}
                 <User size={14} /> ניהול סוכנים
               </button>
               <button 
-                onClick={() => window.open('/api/auth/google', '_blank')}
+                onClick={() => window.open('/api/drive/auth', '_blank')}
                 className="text-indigo-600 hover:underline font-medium flex items-center gap-1"
               >
                 <ExternalLink size={14} /> חיבור לגוגל דרייב
