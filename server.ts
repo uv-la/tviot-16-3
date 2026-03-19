@@ -448,6 +448,7 @@ async function startServer() {
       // Return only non-sensitive info
       res.json({
         customer_name: claim.customer_name,
+        customer_address: claim.customer_address,
         car_number: claim.car_number,
         car_model: claim.car_model,
         status: claim.status,
@@ -462,6 +463,11 @@ async function startServer() {
         requested_docs_customer: claim.requested_docs_customer || [],
         requested_docs_appraiser: claim.requested_docs_appraiser || [],
         requested_docs_garage: claim.requested_docs_garage || [],
+        marked_docs: claim.marked_docs || [],
+        garage_name: claim.garage_name,
+        garage_address: claim.garage_address,
+        garage_phone: claim.garage_phone,
+        garage_settlement: claim.garage_settlement,
         // Include document paths so they can be viewed
         claim_form_path: claim.claim_form_path,
         appraiser_report_path: claim.appraiser_report_path,
@@ -481,8 +487,7 @@ async function startServer() {
         lien_confirmation_path: claim.lien_confirmation_path,
         accountant_confirmation_path: claim.accountant_confirmation_path,
         policy_file_path: claim.policy_file_path,
-        demand_letter_path: claim.demand_letter_path,
-        marked_docs: claim.marked_docs || []
+        demand_letter_path: claim.demand_letter_path
       });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -590,6 +595,60 @@ async function startServer() {
         claim_id: id,
         username: partyName,
         content: `${partyName} העלה מסמך: ${fieldLabels[field] || field}`,
+        created_at: new Date()
+      });
+
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/public/garages", async (req, res) => {
+    try {
+      const garages = await db.collection("entities").find({ type: 'garage' }).toArray();
+      res.json(garages.map((g: any) => ({
+        name: g.name,
+        phone: g.phone,
+        email: g.email,
+        location: g.address || g.city || ''
+      })));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.put("/api/public/claims/:id/garage", async (req, res) => {
+    const { id } = req.params;
+    const { garage_name, garage_phone, garage_email, garage_settlement, garage_address } = req.body;
+
+    try {
+      if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid ID" });
+      
+      const update = {
+        $set: {
+          garage_name,
+          garage_phone,
+          garage_email,
+          garage_settlement,
+          garage_address,
+          last_activity_at: new Date(),
+          has_customer_updates: true
+        }
+      };
+
+      const result = await db.collection("claims").updateOne(
+        { _id: new ObjectId(id) },
+        update
+      );
+
+      if (result.matchedCount === 0) return res.status(404).json({ error: "Claim not found" });
+
+      // Log the update
+      await db.collection("claim_logs").insertOne({
+        claim_id: id,
+        username: "מערכת (לקוח)",
+        content: `הלקוח עדכן מוסך: ${garage_name} (${garage_settlement})`,
         created_at: new Date()
       });
 

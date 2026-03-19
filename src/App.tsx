@@ -368,6 +368,10 @@ function PublicClaimUpdates({ claimId, setDbStatus }: { claimId: string, setDbSt
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [uploadingField, setUploadingField] = useState<string | null>(null);
+  const [isSearchingGarages, setIsSearchingGarages] = useState(false);
+  const [garageSearchType, setGarageSearchType] = useState<'importer' | 'agreement'>('importer');
+  const [garageSearchResults, setGarageSearchResults] = useState<any[]>([]);
+  const [isGarageSearchModalOpen, setIsGarageSearchModalOpen] = useState(false);
 
   // Get party from URL
   const urlParams = new URLSearchParams(window.location.search);
@@ -399,6 +403,145 @@ function PublicClaimUpdates({ claimId, setDbStatus }: { claimId: string, setDbSt
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const searchImporterGarages = async () => {
+    if (!claimInfo.car_model || !claimInfo.insurance_company) {
+      alert('מידע חסר לחיפוש מוסך');
+      return;
+    }
+
+    setGarageSearchType('importer');
+    setIsSearchingGarages(true);
+    setIsGarageSearchModalOpen(true);
+    setGarageSearchResults([]);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      // Fetch local garages for public view
+      let localGarages = [];
+      try {
+        const res = await fetch('/api/public/garages');
+        if (res.ok) localGarages = await res.json();
+      } catch (e) {
+        console.warn('Failed to fetch local garages for public view');
+      }
+
+      const prompt = `
+        אתה סוכן ביטוח חכם ומקצועי. המשימה שלך היא לעזור ללקוח למצוא מוסך יבואן מורשה שבהסדר עם חברת הביטוח שלו.
+        
+        פרטי הרכב: ${claimInfo.car_model}
+        חברת ביטוח: ${claimInfo.insurance_company}
+        כתובת הלקוח: ${claimInfo.customer_address || 'לא צוינה'}
+
+        להלן רשימת מוסכים קיימת במערכת, בדוק אם מישהו מהם מתאים והוא מוסך מורשה ליבואן של ${claimInfo.car_model}:
+        ${JSON.stringify(localGarages)}
+
+        בנוסף, חפש מוסכים נוספים שמופיעים באתר חברת הביטוח: ${INSURANCE_GARAGE_URLS[claimInfo.insurance_company] || ''}.
+        
+        עבור כל מוסך מצא:
+        1. שם המוסך
+        2. עיר/מיקום
+        3. טלפון (אם זמין)
+        4. האם הוא מוסך יבואן רשמי של ${claimInfo.car_model}
+        5. תיאור קצר למה הוא מתאים (למשל: "מוסך הסדר מורשה יבואן")
+        
+        החזר רשימה בפורמט JSON בלבד:
+        [
+          { "name": "...", "location": "...", "phone": "...", "is_importer": true/false, "description": "..." }
+        ]
+      `;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [{ parts: [{ text: prompt }] }],
+        config: { 
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json" 
+        },
+      });
+
+      const results = JSON.parse(response.text);
+      setGarageSearchResults(results);
+    } catch (error) {
+      console.error('Error searching garages:', error);
+      alert('שגיאה בחיפוש מוסכים');
+    } finally {
+      setIsSearchingGarages(false);
+    }
+  };
+
+  const searchAgreementGarages = async () => {
+    if (!claimInfo.insurance_company) {
+      alert('יש לבחור חברת ביטוח');
+      return;
+    }
+
+    setGarageSearchType('agreement');
+    setIsSearchingGarages(true);
+    setIsGarageSearchModalOpen(true);
+    setGarageSearchResults([]);
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const prompt = `
+        חפש את כל מוסכי ההסדר של חברת הביטוח ${claimInfo.insurance_company}.
+        ${claimInfo.customer_address ? `אם הכתובת הבאה מכילה עיר, התמקד במוסכים באותה עיר: ${claimInfo.customer_address}.` : ''}
+        התמקד במוסכים שמופיעים באתר חברת הביטוח: ${INSURANCE_GARAGE_URLS[claimInfo.insurance_company] || ''}.
+        עבור כל מוסך מצא:
+        1. שם המוסך
+        2. עיר/מיקום
+        3. טלפון (אם זמין)
+        4. האם הוא מוסך יבואן רשמי (אם ידוע)
+        
+        החזר רשימה בפורמט JSON:
+        [
+          { "name": "...", "location": "...", "phone": "...", "is_importer": true/false, "description": "..." }
+        ]
+      `;
+
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [{ parts: [{ text: prompt }] }],
+        config: { 
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json" 
+        },
+      });
+
+      const results = JSON.parse(response.text);
+      setGarageSearchResults(results);
+    } catch (error) {
+      console.error('Error searching agreement garages:', error);
+      alert('שגיאה בחיפוש מוסכי הסדר');
+    } finally {
+      setIsSearchingGarages(false);
+    }
+  };
+
+  const handleSelectGarage = async (garage: any) => {
+    try {
+      const res = await fetch(`/api/public/claims/${claimId}/garage`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          garage_name: garage.name,
+          garage_address: garage.location,
+          garage_phone: garage.phone,
+          garage_settlement: garageSearchType === 'agreement' ? 'מוסך הסדר' : 'מוסך יבואן'
+        })
+      });
+
+      if (!res.ok) throw new Error('שגיאה בעדכון המוסך');
+
+      setIsGarageSearchModalOpen(false);
+      await fetchData();
+      alert(`המוסך ${garage.name} נבחר בהצלחה!`);
+    } catch (err) {
+      console.error('Failed to select garage:', err);
+      alert('שגיאה בבחירת המוסך');
     }
   };
 
@@ -572,6 +715,80 @@ function PublicClaimUpdates({ claimId, setDbStatus }: { claimId: string, setDbSt
           </div>
           
           <div className="space-y-6">
+            {/* Garage Selection Section for Customer */}
+            {(!party || party === 'customer') && !claimInfo.garage_name && (
+              <div className="p-4 bg-blue-50 border border-blue-100 rounded-2xl space-y-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-blue-100 rounded-xl flex items-center justify-center text-blue-600">
+                    <Building2 size={20} />
+                  </div>
+                  <div>
+                    <p className="text-sm font-bold text-blue-900">בחירת מוסך לתיקון</p>
+                    <p className="text-[10px] text-blue-600">בחר מוסך הסדר או מוסך יבואן לתיקון הרכב</p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <button 
+                    onClick={searchImporterGarages}
+                    className="flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-600 text-white rounded-xl hover:bg-blue-700 transition-all font-bold text-xs shadow-sm"
+                  >
+                    <Search size={14} />
+                    חיפוש מוסך יבואן
+                  </button>
+                  <button 
+                    onClick={searchAgreementGarages}
+                    className="flex items-center justify-center gap-2 px-4 py-2.5 bg-white text-blue-600 border border-blue-200 rounded-xl hover:bg-blue-50 transition-all font-bold text-xs shadow-sm"
+                  >
+                    <ClipboardList size={14} />
+                    חיפוש מוסך הסדר
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Selected Garage Info */}
+            {(!party || party === 'customer') && claimInfo.garage_name && (
+              <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-2xl">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-emerald-100 rounded-xl flex items-center justify-center text-emerald-600">
+                      <CheckCircle2 size={20} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold text-emerald-900">מוסך נבחר: {claimInfo.garage_name}</p>
+                      <p className="text-[10px] text-emerald-600">{claimInfo.garage_settlement} | {claimInfo.garage_address}</p>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={async () => {
+                      if (window.confirm('האם ברצונך לשנות את המוסך הנבחר?')) {
+                        try {
+                          const res = await fetch(`/api/public/claims/${claimId}/garage`, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              garage_name: '',
+                              garage_address: '',
+                              garage_phone: '',
+                              garage_settlement: ''
+                            })
+                          });
+                          if (!res.ok) throw new Error('שגיאה בעדכון המוסך');
+                          await fetchData();
+                        } catch (err) {
+                          console.error('Failed to clear garage:', err);
+                          alert('שגיאה בביטול בחירת המוסך');
+                        }
+                      }
+                    }}
+                    className="text-emerald-600 hover:text-emerald-800 text-xs font-bold"
+                  >
+                    שינוי
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Missing Documents */}
             {Object.keys(DOC_LABELS).filter(field => !claimInfo[field] && requestedDocs?.includes(field)).length > 0 && (
               <div className="space-y-3">
@@ -700,6 +917,95 @@ function PublicClaimUpdates({ claimId, setDbStatus }: { claimId: string, setDbSt
           © {new Date().getFullYear()} מערכת ניהול תביעות רכב - כל העדכונים מסופקים בזמן אמת
         </div>
       </div>
+
+      {/* Garage Search Modal for Public View */}
+      <AnimatePresence>
+        {isGarageSearchModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setIsGarageSearchModalOpen(false)} className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" />
+            <motion.div initial={{ opacity: 0, scale: 0.95, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95, y: 20 }} className="relative bg-white w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
+              <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between bg-indigo-900 text-white shrink-0">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-white/20 rounded-xl"><Search size={24} /></div>
+                  <div>
+                    <h2 className="text-xl font-bold">חיפוש מוסך {garageSearchType === 'importer' ? 'יבואן' : 'הסדר'}</h2>
+                    <p className="text-indigo-100 text-xs">חברת ביטוח: {claimInfo.insurance_company}</p>
+                  </div>
+                </div>
+                <button onClick={() => setIsGarageSearchModalOpen(false)} className="p-2 hover:bg-white/10 rounded-full transition-colors"><X size={24} /></button>
+              </div>
+              
+              <div className="p-6 overflow-y-auto bg-slate-50 flex-1">
+                {isSearchingGarages ? (
+                  <div className="flex flex-col items-center justify-center py-20 space-y-4">
+                    <div className="w-12 h-12 border-4 border-indigo-900/20 border-t-indigo-900 rounded-full animate-spin" />
+                    <p className="text-slate-500 font-medium">מחפש מוסכים מתאימים...</p>
+                  </div>
+                ) : garageSearchResults.length > 0 ? (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-sm font-bold text-slate-600">נמצאו {garageSearchResults.length} מוסכים:</p>
+                    </div>
+                    <div className="grid grid-cols-1 gap-4">
+                    {garageSearchResults.map((garage, idx) => (
+                      <div key={idx} className="bg-white p-5 rounded-2xl border border-slate-200 hover:border-indigo-900/30 hover:shadow-xl hover:shadow-indigo-900/5 transition-all group">
+                        <div className="flex justify-between items-start mb-3">
+                          <div>
+                            <h3 className="font-bold text-slate-900 text-lg group-hover:text-indigo-900 transition-colors">{garage.name}</h3>
+                            <p className="text-sm text-slate-500 flex items-center gap-1">
+                              <MapPin size={14} className="text-indigo-900" /> {garage.location}
+                            </p>
+                          </div>
+                          <button 
+                            onClick={() => handleSelectGarage(garage)}
+                            className="bg-indigo-900 text-white px-4 py-2 rounded-xl text-sm font-bold hover:bg-indigo-800 transition-all shadow-lg shadow-indigo-100 active:scale-95"
+                          >
+                            בחר מוסך
+                          </button>
+                        </div>
+                        {garage.phone && (
+                          <p className="text-sm text-slate-600 flex items-center gap-2 mb-3">
+                            <div className="p-1.5 bg-slate-100 rounded-lg"><Phone size={14} className="text-indigo-900" /></div>
+                            <span dir="ltr">{garage.phone}</span>
+                          </p>
+                        )}
+                        {garage.description && (
+                          <div className="text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-xl border border-slate-100 italic">
+                            {garage.description}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-16 space-y-4">
+                    <div className="w-20 h-20 bg-white text-slate-200 rounded-full flex items-center justify-center mx-auto shadow-inner">
+                      <AlertCircle size={40} />
+                    </div>
+                    <div>
+                      <p className="text-slate-600 font-bold text-lg">לא נמצאו תוצאות לחיפוש זה</p>
+                      <p className="text-slate-400 text-sm mt-1">נסה לחפש ידנית באתר חברת הביטוח או להזין פרטים ידנית.</p>
+                    </div>
+                    <a 
+                      href={INSURANCE_GARAGE_URLS[claimInfo.insurance_company] || '#'} 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-2 bg-white text-indigo-900 px-6 py-3 rounded-xl font-bold border-2 border-indigo-900 hover:bg-indigo-50 transition-all shadow-sm"
+                    >
+                      מעבר לאתר {claimInfo.insurance_company} <ExternalLink size={16} />
+                    </a>
+                  </div>
+                )}
+              </div>
+              
+              <div className="p-4 bg-white border-t border-slate-100 text-center">
+                <p className="text-[10px] text-slate-400 font-medium">המידע מבוסס על חיפוש חכם ועשוי להשתנות. מומלץ לוודא מול חברת הביטוח.</p>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -1522,19 +1828,25 @@ export default function App() {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const localGarages = entities.filter(e => e.type === 'garage').map(e => ({ name: e.name, phone: e.phone, email: e.email }));
       const prompt = `
-        חפש מוסכי יבואן מורשים עבור רכב מסוג ${formData.car_model} שבהסדר עם חברת הביטוח ${formData.insurance_company}.
+        אתה סוכן ביטוח חכם ומקצועי. המשימה שלך היא לעזור ללקוח למצוא מוסך יבואן מורשה שבהסדר עם חברת הביטוח שלו.
         
+        פרטי הרכב: ${formData.car_model}
+        חברת ביטוח: ${formData.insurance_company}
+        כתובת הלקוח: ${formData.customer_address || 'לא צוינה'}
+
         להלן רשימת מוסכים קיימת במערכת, בדוק אם מישהו מהם מתאים והוא מוסך מורשה ליבואן של ${formData.car_model}:
         ${JSON.stringify(localGarages)}
 
         בנוסף, חפש מוסכים נוספים שמופיעים באתר חברת הביטוח: ${INSURANCE_GARAGE_URLS[formData.insurance_company] || ''}.
+        
         עבור כל מוסך מצא:
         1. שם המוסך
         2. עיר/מיקום
         3. טלפון (אם זמין)
-        4. האם הוא מוסך יבואן רשמי
+        4. האם הוא מוסך יבואן רשמי של ${formData.car_model}
+        5. תיאור קצר למה הוא מתאים (למשל: "מוסך הסדר מורשה יבואן")
         
-        החזר רשימה בפורמט JSON:
+        החזר רשימה בפורמט JSON בלבד:
         [
           { "name": "...", "location": "...", "phone": "...", "is_importer": true/false, "description": "..." }
         ]
@@ -2036,7 +2348,7 @@ ${statusLink}
     const encodedMessage = encodeURIComponent(whatsAppFormData.message);
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     const whatsappUrl = isMobile 
-      ? `https://api.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`
+      ? `whatsapp://send?phone=${phone}&text=${encodedMessage}`
       : `https://web.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
     
     // Log the action
