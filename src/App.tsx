@@ -964,10 +964,10 @@ function PublicClaimUpdates({ claimId, setDbStatus }: { claimId: string, setDbSt
                           </button>
                         </div>
                         {garage.phone && (
-                          <p className="text-sm text-slate-600 flex items-center gap-2 mb-3">
+                          <div className="text-sm text-slate-600 flex items-center gap-2 mb-3">
                             <div className="p-1.5 bg-slate-100 rounded-lg"><Phone size={14} className="text-indigo-900" /></div>
                             <span dir="ltr">{garage.phone}</span>
-                          </p>
+                          </div>
                         )}
                         {garage.description && (
                           <div className="text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-xl border border-slate-100 italic">
@@ -6215,10 +6215,10 @@ ${shortPublicUrl}
                           </button>
                         </div>
                         {garage.phone && (
-                          <p className="text-sm text-slate-600 flex items-center gap-2 mb-3">
+                          <div className="text-sm text-slate-600 flex items-center gap-2 mb-3">
                             <div className="p-1.5 bg-slate-100 rounded-lg"><Phone size={14} className="text-blue-900" /></div>
                             <span dir="ltr">{garage.phone}</span>
-                          </p>
+                          </div>
                         )}
                         {garage.description && (
                           <div className="text-xs text-slate-500 leading-relaxed bg-slate-50 p-3 rounded-xl border border-slate-100 italic">
