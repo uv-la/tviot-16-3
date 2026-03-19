@@ -271,6 +271,87 @@ const CUSTOMER_DOCS = [
 const APPRAISER_DOCS = ['appraiser_report_path', 'appraiser_invoice_path', 'appraiser_photos_path'];
 const GARAGE_DOCS = ['garage_invoice_path'];
 
+const DatabaseStatusBanner = ({ 
+  dbStatus, 
+  checkDbHealth, 
+  showSetupGuide, 
+  setShowSetupGuide 
+}: { 
+  dbStatus: any, 
+  checkDbHealth: () => void, 
+  showSetupGuide: boolean, 
+  setShowSetupGuide: (show: boolean) => void 
+}) => {
+  if (dbStatus?.status !== 'error') return null;
+
+  return (
+    <div className="sticky top-0 z-[100] flex flex-col font-sans" dir="rtl">
+      <div className="bg-red-600 text-white p-4 text-center font-bold flex items-center justify-center gap-4">
+        <AlertTriangle size={20} />
+        <span>
+          {dbStatus.configured 
+            ? "שגיאה בחיבור ל-MongoDB. וודא שכתובת ה-Connection String ב-Secrets נכונה."
+            : "משתנה הסביבה MONGODB_CONNECTION_STRING חסר. יש להגדיר אותו ב-Secrets."}
+        </span>
+        <div className="flex gap-2">
+          <button 
+            onClick={checkDbHealth}
+            className="bg-white text-red-600 px-3 py-1 rounded-lg text-sm hover:bg-gray-100 transition-colors"
+          >
+            נסה שוב
+          </button>
+          {dbStatus.setupGuide && (
+            <button 
+              onClick={() => setShowSetupGuide(!showSetupGuide)}
+              className="bg-red-700 text-white px-3 py-1 rounded-lg text-sm hover:bg-red-800 transition-colors flex items-center gap-1"
+            >
+              <Info size={14} />
+              {showSetupGuide ? "הסתר מדריך" : "מדריך הגדרה"}
+            </button>
+          )}
+        </div>
+      </div>
+      
+      <AnimatePresence>
+        {showSetupGuide && dbStatus.setupGuide && (
+          <motion.div 
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="bg-red-50 border-b border-red-200 overflow-hidden"
+          >
+            <div className="max-w-4xl mx-auto p-6">
+              <h3 className="text-red-900 font-bold mb-4 flex items-center gap-2">
+                <Settings size={18} />
+                מדריך לפתרון בעיות חיבור למסד הנתונים:
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {Object.entries(dbStatus.setupGuide).map(([key, value]: [string, any]) => (
+                  <div key={key} className="bg-white p-4 rounded-xl border border-red-100 shadow-sm">
+                    <div className="flex items-start gap-3">
+                      <div className="bg-red-100 text-red-600 w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 font-bold text-xs">
+                        {key.replace('step', '')}
+                      </div>
+                      <p className="text-sm text-slate-700 leading-relaxed">{value}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-6 p-4 bg-amber-50 rounded-xl border border-amber-200 text-amber-800 text-sm">
+                <p className="font-bold mb-1 flex items-center gap-2">
+                  <AlertCircle size={16} />
+                  טיפ חשוב:
+                </p>
+                אם הסיסמה שלך מכילה תווים מיוחדים (כמו @, :, /), עליך לקודד אותם (URL-encode). למשל, @ הופך ל-%40.
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};
+
 const JOTFORM_LINKS: Record<string, string> = {
   'איילון': 'https://form.jotform.com/232780982444060',
   'שומרה': 'https://form.jotform.com/232783244966467',
@@ -282,7 +363,7 @@ const JOTFORM_LINKS: Record<string, string> = {
   'מנורה': 'https://form.jotform.com/233192204698460',
 };
 
-function PublicClaimUpdates({ claimId }: { claimId: string }) {
+function PublicClaimUpdates({ claimId, setDbStatus }: { claimId: string, setDbStatus?: (status: any) => void }) {
   const [claimInfo, setClaimInfo] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -292,16 +373,29 @@ function PublicClaimUpdates({ claimId }: { claimId: string }) {
   const urlParams = new URLSearchParams(window.location.search);
   const party = (urlParams.get('party') || urlParams.get('p')) as 'customer' | 'appraiser' | 'garage' | null;
 
-  const fetchData = async () => {
+  const fetchData = async (retries = 5) => {
     try {
       const infoRes = await fetch(`/api/public/claims/${claimId}/info`);
 
-      if (!infoRes.ok) throw new Error('התביעה לא נמצאה או שאין גישה');
+      if (!infoRes.ok) {
+        if (infoRes.status === 503 && setDbStatus) {
+          const errorData = await infoRes.json();
+          setDbStatus({ status: 'error', ...errorData });
+          throw new Error(errorData.error || 'שגיאת מסד נתונים');
+        }
+        throw new Error('התביעה לא נמצאה או שאין גישה');
+      }
 
       const info = await infoRes.json();
 
       setClaimInfo(info);
+      if (setDbStatus) setDbStatus({ status: 'ok' });
     } catch (err: any) {
+      console.error('Error fetching public claim info:', err);
+      if (retries > 0 && (err.message === 'Failed to fetch' || err.name === 'TypeError')) {
+        setTimeout(() => fetchData(retries - 1), 2000);
+        return;
+      }
       setError(err.message);
     } finally {
       setLoading(false);
@@ -324,7 +418,6 @@ function PublicClaimUpdates({ claimId }: { claimId: string }) {
     const isMultiple = ['appraiser_report_path', 'appraiser_invoice_path', 'appraiser_photos_path', 'garage_invoice_path'].includes(field);
 
     try {
-      let lastUploadError: { error?: string; authUrl?: string } | null = null;
       const uploadPromises = Array.from(files).map(async (file: File) => {
         const formDataUpload = new FormData();
         formDataUpload.append('file', file, file.name);
@@ -336,20 +429,12 @@ function PublicClaimUpdates({ claimId }: { claimId: string }) {
           const data = await uploadRes.json();
           return data.path;
         }
-        const errData = await uploadRes.json().catch(() => ({}));
-        lastUploadError = errData;
         console.error('Individual file upload failed:', file.name);
         return null;
       });
 
       const uploadedPaths = (await Promise.all(uploadPromises)).filter(Boolean) as string[];
-      if (uploadedPaths.length === 0) {
-        if (lastUploadError?.authUrl) {
-          window.open(lastUploadError.authUrl, '_blank');
-          throw new Error('Google Drive לא מחובר. נפתח חלון לחיבור.');
-        }
-        throw new Error(lastUploadError?.error || 'העלאת הקבצים נכשלה');
-      }
+      if (uploadedPaths.length === 0) throw new Error('העלאת הקבצים נכשלה');
 
       const docRes = await fetch(`/api/public/claims/${claimId}/documents?party=${party || ''}`, {
         method: 'PUT',
@@ -709,6 +794,7 @@ export default function App() {
   const [isArchiveView, setIsArchiveView] = useState(false);
   const [dbStatus, setDbStatus] = useState<any>(null);
   const [isDbChecking, setIsDbChecking] = useState(true);
+  const [showSetupGuide, setShowSetupGuide] = useState(false);
   const [currentView, setCurrentView] = useState<'claims' | 'dashboard' | 'reports'>('claims');
   const [openDocListId, setOpenDocListId] = useState<string | number | null>(null);
   
@@ -789,6 +875,13 @@ export default function App() {
       setIsDbChecking(true);
       const res = await fetch('/api/debug/db');
       const contentType = res.headers.get('content-type');
+      
+      if (res.status === 503) {
+        const data = await res.json();
+        setDbStatus({ status: 'error', ...data });
+        return;
+      }
+
       if (!res.ok || (contentType && !contentType.includes('application/json'))) {
         setDbStatus({ status: 'error', message: 'השרת בתהליך אתחול...' });
         return;
@@ -803,7 +896,7 @@ export default function App() {
     }
   };
 
-  const fetchQuestionnaire = async (id: string) => {
+  const fetchQuestionnaire = async (id: string, retries = 5) => {
     try {
       setIsFetchingQ(true);
       const response = await fetch(`/api/questionnaires/${id}`);
@@ -821,11 +914,23 @@ export default function App() {
           car_model: data.claim.car_model,
           event_date: data.claim.claim_date
         }));
+        // Clear DB error if successful
+        if (dbStatus?.status === 'error') {
+          setDbStatus(null);
+        }
       } else {
+        if (response.status === 503) {
+          const errorData = await response.json();
+          setDbStatus({ status: 'error', ...errorData });
+        }
         setQError('השאלון לא נמצא או שכבר הושלם');
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error fetching questionnaire:", error);
+      if (retries > 0 && (error.message === 'Failed to fetch' || error.name === 'TypeError')) {
+        setTimeout(() => fetchQuestionnaire(id, retries - 1), 2000);
+        return;
+      }
       setQError('שגיאת תקשורת בטעינת השאלון');
     } finally {
       setIsFetchingQ(false);
@@ -1611,7 +1716,6 @@ export default function App() {
     const isMultiple = ['appraiser_report_path', 'appraiser_invoice_path', 'appraiser_photos_path', 'garage_invoice_path'].includes(field);
     
     try {
-      let lastUploadError: { error?: string; authUrl?: string } | null = null;
       const uploadPromises = Array.from(files).map(async (file: File) => {
         const formDataUpload = new FormData();
         formDataUpload.append('file', file, file.name);
@@ -1623,22 +1727,12 @@ export default function App() {
           const data = await response.json();
           return data.path;
         }
-        const errData = await response.json().catch(() => ({}));
-        lastUploadError = errData;
         console.error('Individual file upload failed:', file.name);
         return null;
       });
 
       const uploadedPaths = (await Promise.all(uploadPromises)).filter(Boolean) as string[];
-      if (uploadedPaths.length === 0) {
-        if (lastUploadError?.authUrl) {
-          showToast(lastUploadError.error || 'Google Drive לא מחובר', 'error');
-          window.open(lastUploadError.authUrl, '_blank');
-        } else {
-          showToast(lastUploadError?.error || 'העלאת הקבצים נכשלה', 'error');
-        }
-        return;
-      }
+      if (uploadedPaths.length === 0) return;
 
       let newFormData: any;
       if (isMultiple) {
@@ -1778,6 +1872,12 @@ export default function App() {
       const contentType = response.headers.get('content-type');
       
       if (!response.ok) {
+        if (response.status === 503) {
+          const errorData = await response.json();
+          setDbStatus({ status: 'error', ...errorData });
+          throw new Error(errorData.error || 'שגיאת מסד נתונים');
+        }
+        
         if (contentType && contentType.includes('text/html')) {
           if (retries > 0) {
             console.log(`Server initializing, retrying fetchClaims... (${retries} left)`);
@@ -1806,8 +1906,17 @@ export default function App() {
       
       const data = await response.json();
       setClaims(data);
+      if (dbStatus?.status === 'error') setDbStatus({ status: 'ok' });
     } catch (error: any) {
       console.error('Error fetching claims:', error);
+      
+      // Handle "Failed to fetch" which happens during server restarts
+      if (retries > 0 && (error.message === 'Failed to fetch' || error.name === 'TypeError')) {
+        console.log(`Fetch failed, retrying fetchClaims... (${retries} left)`);
+        setTimeout(() => fetchClaims(retries - 1), 3000);
+        return;
+      }
+
       // Only show toast if it's the last retry or a real error
       if (retries === 0 || !error.message.includes('תהליך אתחול')) {
         showToast(error.message || 'שגיאה בטעינת תביעות', 'error');
@@ -1820,6 +1929,11 @@ export default function App() {
       const response = await fetch('/api/users');
       const contentType = response.headers.get('content-type');
       if (!response.ok) {
+        if (response.status === 503) {
+          const errorData = await response.json();
+          setDbStatus({ status: 'error', ...errorData });
+          throw new Error(errorData.error || 'שגיאת מסד נתונים');
+        }
         if (contentType && contentType.includes('text/html')) {
           if (retries > 0) {
             console.log(`Server initializing, retrying fetchUsers... (${retries} left)`);
@@ -1840,8 +1954,12 @@ export default function App() {
       }
       const data = await response.json();
       setUsers(data);
-    } catch (error) {
+      if (dbStatus?.status === 'error') setDbStatus({ status: 'ok' });
+    } catch (error: any) {
       console.error('Error fetching users:', error);
+      if (retries > 0 && (error.message === 'Failed to fetch' || error.name === 'TypeError')) {
+        setTimeout(() => fetchUsers(retries - 1), 3000);
+      }
     }
   };
 
@@ -1850,6 +1968,11 @@ export default function App() {
       const response = await fetch('/api/agents');
       const contentType = response.headers.get('content-type');
       if (!response.ok) {
+        if (response.status === 503) {
+          const errorData = await response.json();
+          setDbStatus({ status: 'error', ...errorData });
+          throw new Error(errorData.error || 'שגיאת מסד נתונים');
+        }
         if (contentType && contentType.includes('text/html')) {
           if (retries > 0) {
             setTimeout(() => fetchAgents(retries - 1), 3000);
@@ -1868,8 +1991,12 @@ export default function App() {
       }
       const data = await response.json();
       setAgents(data);
-    } catch (error) {
+      if (dbStatus?.status === 'error') setDbStatus({ status: 'ok' });
+    } catch (error: any) {
       console.error('Error fetching agents:', error);
+      if (retries > 0 && (error.message === 'Failed to fetch' || error.name === 'TypeError')) {
+        setTimeout(() => fetchAgents(retries - 1), 3000);
+      }
     }
   };
 
@@ -1979,6 +2106,11 @@ ${statusLink}
       const response = await fetch('/api/entities');
       const contentType = response.headers.get('content-type');
       if (!response.ok) {
+        if (response.status === 503) {
+          const errorData = await response.json();
+          setDbStatus({ status: 'error', ...errorData });
+          throw new Error(errorData.error || 'שגיאת מסד נתונים');
+        }
         if (contentType && contentType.includes('text/html')) {
           if (retries > 0) {
             setTimeout(() => fetchEntities(retries - 1), 3000);
@@ -1997,8 +2129,12 @@ ${statusLink}
       }
       const data = await response.json();
       setEntities(data);
-    } catch (error) {
+      if (dbStatus?.status === 'error') setDbStatus({ status: 'ok' });
+    } catch (error: any) {
       console.error('Error fetching entities:', error);
+      if (retries > 0 && (error.message === 'Failed to fetch' || error.name === 'TypeError')) {
+        setTimeout(() => fetchEntities(retries - 1), 3000);
+      }
     }
   };
 
@@ -2007,6 +2143,11 @@ ${statusLink}
       const response = await fetch('/api/claim-handlers');
       const contentType = response.headers.get('content-type');
       if (!response.ok) {
+        if (response.status === 503) {
+          const errorData = await response.json();
+          setDbStatus({ status: 'error', ...errorData });
+          throw new Error(errorData.error || 'שגיאת מסד נתונים');
+        }
         if (contentType && contentType.includes('text/html')) {
           if (retries > 0) {
             setTimeout(() => fetchClaimHandlers(retries - 1), 3000);
@@ -2025,8 +2166,12 @@ ${statusLink}
       }
       const data = await response.json();
       setClaimHandlers(data);
-    } catch (error) {
+      if (dbStatus?.status === 'error') setDbStatus({ status: 'ok' });
+    } catch (error: any) {
       console.error('Error fetching claim handlers:', error);
+      if (retries > 0 && (error.message === 'Failed to fetch' || error.name === 'TypeError')) {
+        setTimeout(() => fetchClaimHandlers(retries - 1), 3000);
+      }
     }
   };
 
@@ -2850,7 +2995,6 @@ ${shortPublicUrl}
     if (!files || files.length === 0) return;
     
     showToast('מעלה קבצים...', 'info');
-    let lastUploadError: { error?: string; authUrl?: string } | null = null;
     const uploadPromises = Array.from(files).map(async (file: File) => {
       const formDataUpload = new FormData();
       formDataUpload.append('file', file, file.name);
@@ -2862,21 +3006,13 @@ ${shortPublicUrl}
         const data = await uploadRes.json();
         return { path: data.path, name: file.name };
       }
-      lastUploadError = await uploadRes.json().catch(() => ({})) as { error?: string; authUrl?: string };
       console.error('Individual attachment upload failed:', file.name);
       return null;
     });
 
     const uploadedResults = (await Promise.all(uploadPromises)).filter(Boolean) as {path: string, name: string}[];
     setSubmitAttachments(prev => [...prev, ...uploadedResults]);
-    if (uploadedResults.length === 0 && lastUploadError?.authUrl) {
-      showToast('Google Drive לא מחובר', 'error');
-      window.open(lastUploadError.authUrl, '_blank');
-    } else if (uploadedResults.length > 0) {
-      showToast('הקבצים נוספו בהצלחה', 'success');
-    } else if (lastUploadError?.error) {
-      showToast(lastUploadError.error, 'error');
-    }
+    showToast('הקבצים נוספו בהצלחה', 'success');
   };
 
   const openLogs = (claim: Claim) => {
@@ -3271,19 +3407,69 @@ ${shortPublicUrl}
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-right" dir="rtl">
       {dbStatus?.status === 'error' && (
-        <div className="bg-red-600 text-white p-4 text-center font-bold flex items-center justify-center gap-4 sticky top-0 z-[100]">
-          <AlertTriangle size={20} />
-          <span>
-            {dbStatus.configured 
-              ? "שגיאה בחיבור ל-MongoDB. וודא שכתובת ה-Connection String ב-Secrets נכונה."
-              : "משתנה הסביבה MONGODB_CONNECTION_STRING חסר. יש להגדיר אותו ב-Secrets."}
-          </span>
-          <button 
-            onClick={checkDbHealth}
-            className="bg-white text-red-600 px-3 py-1 rounded-lg text-sm hover:bg-gray-100 transition-colors"
-          >
-            נסה שוב
-          </button>
+        <div className="sticky top-0 z-[100] flex flex-col">
+          <div className="bg-red-600 text-white p-4 text-center font-bold flex items-center justify-center gap-4">
+            <AlertTriangle size={20} />
+            <span>
+              {dbStatus.configured 
+                ? "שגיאה בחיבור ל-MongoDB. וודא שכתובת ה-Connection String ב-Secrets נכונה."
+                : "משתנה הסביבה MONGODB_CONNECTION_STRING חסר. יש להגדיר אותו ב-Secrets."}
+            </span>
+            <div className="flex gap-2">
+              <button 
+                onClick={checkDbHealth}
+                className="bg-white text-red-600 px-3 py-1 rounded-lg text-sm hover:bg-gray-100 transition-colors"
+              >
+                נסה שוב
+              </button>
+              {dbStatus.setupGuide && (
+                <button 
+                  onClick={() => setShowSetupGuide(!showSetupGuide)}
+                  className="bg-red-700 text-white px-3 py-1 rounded-lg text-sm hover:bg-red-800 transition-colors flex items-center gap-1"
+                >
+                  <Info size={14} />
+                  {showSetupGuide ? "הסתר מדריך" : "מדריך הגדרה"}
+                </button>
+              )}
+            </div>
+          </div>
+          
+          <AnimatePresence>
+            {showSetupGuide && dbStatus.setupGuide && (
+              <motion.div 
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                className="bg-red-50 border-b border-red-200 overflow-hidden"
+              >
+                <div className="max-w-4xl mx-auto p-6">
+                  <h3 className="text-red-900 font-bold mb-4 flex items-center gap-2">
+                    <Settings size={18} />
+                    מדריך לפתרון בעיות חיבור למסד הנתונים:
+                  </h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {Object.entries(dbStatus.setupGuide).map(([key, value]: [string, any]) => (
+                      <div key={key} className="bg-white p-4 rounded-xl border border-red-100 shadow-sm">
+                        <div className="flex items-start gap-3">
+                          <div className="bg-red-100 text-red-600 w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 font-bold text-xs">
+                            {key.replace('step', '')}
+                          </div>
+                          <p className="text-sm text-slate-700 leading-relaxed">{value}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-6 p-4 bg-amber-50 rounded-xl border border-amber-200 text-amber-800 text-sm">
+                    <p className="font-bold mb-1 flex items-center gap-2">
+                      <AlertCircle size={16} />
+                      טיפ חשוב:
+                    </p>
+                    אם הסיסמה שלך מכילה תווים מיוחדים (כמו @, :, /), עליך לקודד אותם (URL-encode). למשל, @ הופך ל-%40.
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
         </div>
       )}
       {/* Header */}
@@ -3348,7 +3534,7 @@ ${shortPublicUrl}
                 <User size={14} /> ניהול סוכנים
               </button>
               <button 
-                onClick={() => window.open('/api/drive/auth', '_blank')}
+                onClick={() => window.open('/api/auth/google', '_blank')}
                 className="text-indigo-600 hover:underline font-medium flex items-center gap-1"
               >
                 <ExternalLink size={14} /> חיבור לגוגל דרייב

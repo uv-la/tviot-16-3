@@ -6,5 +6,3 @@ coverage/
 *.log
 .env*
 !.env.example
-secrets/service-account.json
-secrets/client_secret*.json

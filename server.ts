@@ -2,7 +2,6 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
-import { Readable } from "stream";
 import multer from "multer";
 import fs from "fs";
 import dns from "dns";
@@ -18,9 +17,7 @@ import "dotenv/config";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const ai = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
-  : null;
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 const JOTFORM_LINKS: Record<string, string> = {
   'איילון': 'https://form.jotform.com/232780982444060',
@@ -117,153 +114,23 @@ async function ensureFonts() {
 }
 
 async function ensureFileOnDisk(filePath: string): Promise<string | null> {
-  const normalized = filePath.startsWith("/") ? filePath.slice(1) : filePath;
-  const absolutePath = path.join(__dirname, normalized);
-  console.log("[uploads] ensureFileOnDisk", {
-    requested: filePath,
-    normalized,
-    absolutePath,
-    existsOnDisk: fs.existsSync(absolutePath),
-  });
+  const absolutePath = path.join(__dirname, filePath.startsWith('/') ? filePath.slice(1) : filePath);
   if (fs.existsSync(absolutePath)) return absolutePath;
 
   const filename = path.basename(filePath);
   try {
     if (!db) await connectToMongo();
-    const fileRecord = await db?.collection("files").findOne({ filename });
-    if (fileRecord?.driveFileId) {
-      console.log("[uploads] file not on disk, downloading from Drive", {
-        filename,
-        driveFileId: fileRecord.driveFileId,
-      });
-      const tempPath = path.join(uploadsDir, `_tmp_${nanoid()}${path.extname(filename)}`);
-      const ok = await downloadFromDriveToFile(fileRecord.driveFileId, tempPath);
-      console.log("[uploads] download result", { filename, tempPath, ok });
-      if (ok) return tempPath;
+    const fileRecord = await db.collection("files").findOne({ filename });
+    if (fileRecord) {
+      if (fileRecord.data) {
+        fs.writeFileSync(absolutePath, fileRecord.data.buffer);
+        return absolutePath;
+      }
     }
   } catch (error) {
     console.error("Error ensuring file on disk:", error);
   }
   return null;
-}
-
-// Google Drive Configuration (OAuth2 - works with personal Gmail, no Shared Drive needed)
-const driveFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-const driveClientId = process.env.GOOGLE_CLIENT_ID;
-const driveClientSecret = process.env.GOOGLE_CLIENT_SECRET;
-// IMPORTANT: do not fall back to localhost in production. Render must provide APP_URL/GOOGLE_REDIRECT_URI.
-const driveRedirectUri =
-  process.env.GOOGLE_REDIRECT_URI ||
-  (process.env.APP_URL ? `${process.env.APP_URL}/api/drive/callback` : "");
-
-// NOTE: drive.file can’t always access an existing folder ID (often returns 404).
-// Using full drive scope ensures uploads into a chosen folder work reliably.
-const DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"];
-
-function createOAuth2Client() {
-  if (!driveClientId || !driveClientSecret || !driveRedirectUri) return null;
-  return new google.auth.OAuth2(driveClientId, driveClientSecret, driveRedirectUri);
-}
-
-async function getStoredRefreshToken(): Promise<string | null> {
-  try {
-    if (!db) return null;
-    const doc = await db.collection("drive_oauth").findOne({ id: "default" });
-    return doc?.refresh_token || null;
-  } catch {
-    return null;
-  }
-}
-
-async function getDriveClient(): Promise<ReturnType<typeof google.drive> | null> {
-  if (!driveFolderId) return null;
-  try {
-    const oauth2 = createOAuth2Client();
-    if (!oauth2) return null;
-    const refreshToken = await getStoredRefreshToken();
-    if (!refreshToken) return null;
-    oauth2.setCredentials({ refresh_token: refreshToken });
-    return google.drive({ version: "v3", auth: oauth2 });
-  } catch (e) {
-    console.error("Google Drive init error:", e);
-    return null;
-  }
-}
-
-async function uploadToDrive(
-  filePath: string,
-  fileName: string,
-  mimeType: string
-): Promise<string> {
-  const drive = await getDriveClient();
-  if (!drive) throw new Error("Google Drive not configured");
-  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
-
-  console.log("[drive] uploadToDrive", {
-    localFilePath: filePath,
-    fileName,
-    mimeType,
-    driveFolderId,
-  });
-
-  const fileBuffer = fs.readFileSync(filePath);
-  const res = await drive.files.create({
-    requestBody: {
-      name: fileName,
-      parents: [driveFolderId!],
-    },
-    media: {
-      mimeType: mimeType || "application/octet-stream",
-      body: Readable.from(fileBuffer),
-    },
-    fields: "id",
-    supportsAllDrives: true,
-  });
-  const id = res.data.id;
-  if (!id) throw new Error("Drive API returned no file ID");
-  return id;
-}
-
-async function streamFromDrive(fileId: string, res: express.Response, mimeType?: string): Promise<boolean> {
-  const drive = await getDriveClient();
-  if (!drive) return false;
-  try {
-    const fileRes = await drive.files.get(
-      { fileId, alt: "media", supportsAllDrives: true },
-      { responseType: "stream" }
-    );
-    const stream = fileRes.data as any;
-    if (mimeType) res.contentType(mimeType);
-    stream.pipe(res);
-    return true;
-  } catch (e: any) {
-    console.error("Google Drive stream error:", e?.message || e);
-    return false;
-  }
-}
-
-async function downloadFromDriveToFile(fileId: string, destPath: string): Promise<boolean> {
-  const drive = await getDriveClient();
-  if (!drive) return false;
-  try {
-    console.log("[drive] downloadFromDriveToFile", { fileId, destPath });
-    const fileRes = await drive.files.get(
-      { fileId, alt: "media", supportsAllDrives: true },
-      { responseType: "stream" }
-    );
-    const stream = fileRes.data as NodeJS.ReadableStream;
-    const writeStream = fs.createWriteStream(destPath);
-    await new Promise<void>((resolve, reject) => {
-      stream.on("error", reject);
-      writeStream.on("error", reject);
-      writeStream.on("finish", resolve);
-      stream.pipe(writeStream);
-    });
-    return true;
-  } catch (e: any) {
-    console.error("Google Drive download error:", e?.message || e);
-    return false;
-  }
 }
 
 // MongoDB Configuration
@@ -289,7 +156,19 @@ async function connectToMongo() {
 
   try {
     if (!client) {
-      console.log(`Attempting to connect to MongoDB... (URI length: ${mongoUri.length})`);
+      // Redact URI for logging
+      const redactedUri = mongoUri.replace(/\/\/([^:]+):([^@]+)@/, "//***:***@");
+      console.log(`Attempting to connect to MongoDB... (URI: ${redactedUri})`);
+      
+      // Check for common issues in URI
+      if (!mongoUri.startsWith("mongodb://") && !mongoUri.startsWith("mongodb+srv://")) {
+        console.warn("MONGODB_CONNECTION_STRING does not start with a valid protocol (mongodb:// or mongodb+srv://)");
+      }
+      
+      if (mongoUri.includes("@") && !mongoUri.includes(":") && mongoUri.indexOf("@") < mongoUri.indexOf("/", 10)) {
+         console.warn("MONGODB_CONNECTION_STRING might be missing a password or has incorrect format.");
+      }
+
       client = new MongoClient(mongoUri, {
         connectTimeoutMS: 30000,
         serverSelectionTimeoutMS: 30000,
@@ -302,18 +181,22 @@ async function connectToMongo() {
     await client.connect();
     db = client.db(dbName);
     isDbConnected = true;
-    console.log(`Connected to MongoDB: ${dbName}`);
+    console.log(`Successfully connected to MongoDB database: ${dbName}`);
     
     // Initialize collections and indexes
-    await db.collection("users").createIndex({ username: 1 }, { unique: true });
-    await db.collection("claims").createIndex({ created_at: -1 });
-    await db.collection("claims").createIndex({ claim_number: 1 });
-    await db.collection("entities").createIndex({ name: 1 });
-    await db.collection("claim_handlers").createIndex({ name: 1 });
-    await db.collection("agents").createIndex({ name: 1 });
-    await db.collection("claim_logs").createIndex({ claim_id: 1 });
-    await db.collection("questionnaires").createIndex({ id: 1 }, { unique: true });
-    await db.collection("drive_oauth").createIndex({ id: 1 }, { unique: true });
+    try {
+      await db.collection("users").createIndex({ username: 1 }, { unique: true });
+      await db.collection("claims").createIndex({ created_at: -1 });
+      await db.collection("claims").createIndex({ claim_number: 1 });
+      await db.collection("entities").createIndex({ name: 1 });
+      await db.collection("claim_handlers").createIndex({ name: 1 });
+      await db.collection("agents").createIndex({ name: 1 });
+      await db.collection("claim_logs").createIndex({ claim_id: 1 });
+      await db.collection("questionnaires").createIndex({ id: 1 }, { unique: true });
+      console.log("Database indexes verified.");
+    } catch (indexError) {
+      console.warn("Warning: Failed to create some indexes, but connection is active:", indexError);
+    }
 
     // Ensure default admin exists
     const admin = await db.collection("users").findOne({ username: "admin" });
@@ -361,10 +244,15 @@ async function connectToMongo() {
       await db.collection("agents").insertMany(initialAgents);
       console.log("Initial agents seeded.");
     }
-
-  } catch (error) {
-    console.error("Failed to connect to MongoDB:", error);
+  } catch (error: any) {
+    console.error("Failed to connect to MongoDB:", error.message);
+    if (error.message.includes("Authentication failed") || error.message.includes("bad auth")) {
+      console.error("CRITICAL: MongoDB Authentication Failed. Please check your username and password in MONGODB_CONNECTION_STRING.");
+      console.error("Note: If your password contains special characters like @, :, or /, they MUST be URL-encoded (e.g., @ becomes %40).");
+    }
     isDbConnected = false;
+    // Reset client so next attempt creates a new one
+    client = null;
   }
 }
 
@@ -372,7 +260,7 @@ async function startServer() {
   console.log("Starting server initialization...");
   
   const app = express();
-  const PORT = parseInt(process.env.PORT || "3000", 10);
+  const PORT = 3000;
 
   // Immediate health check route before any middleware or DB connection
   app.get("/api/ping", (req, res) => {
@@ -381,15 +269,26 @@ async function startServer() {
 
   // Middleware to ensure DB is connected for API routes
   app.use("/api", (req, res, next) => {
-    // Skip check for ping and debug routes
-    if (req.path === "/ping" || req.path === "/debug/db" || req.path === "/debug/drive" || req.path.startsWith("/drive/")) return next();
+    // Skip check for ping and debug/db
+    if (req.path === "/ping" || req.path === "/debug/db" || req.path.startsWith("/auth")) return next();
     
     if (!db || !isDbConnected) {
       console.warn(`[DB Check] Database not connected for request: ${req.originalUrl}`);
+      
+      const isAuthError = !process.env.MONGODB_CONNECTION_STRING;
+      
       return res.status(503).json({ 
-        error: "השרת עדיין בתהליך אתחול או שאינו מחובר למסד הנתונים. אנא נסה שוב בעוד מספר שניות.",
+        error: "השרת אינו מחובר למסד הנתונים. אנא בדוק את הגדרות החיבור.",
         dbStatus: isDbConnected ? "connected_no_db" : "disconnected",
-        details: "The server is unable to connect to MongoDB. Please ensure the connection string is valid."
+        details: isAuthError 
+          ? "The MONGODB_CONNECTION_STRING secret is missing. Please add it in Settings -> Secrets."
+          : "MongoDB connection failed. This is usually due to incorrect credentials or network restrictions. Check the server logs for details.",
+        setupGuide: {
+          step1: "Go to Settings (gear icon) -> Secrets",
+          step2: "Add MONGODB_CONNECTION_STRING with your MongoDB Atlas URI",
+          step3: "Ensure your password is URL-encoded if it contains special characters",
+          step4: "Ensure your IP is whitelisted in MongoDB Atlas (0.0.0.0/0 for testing)"
+        }
       });
     }
     next();
@@ -419,21 +318,27 @@ async function startServer() {
   });
 
 
-  // File Retrieval Route: Google Drive only (no MongoDB file storage)
+  // File Retrieval Route with MongoDB fallback
   app.get("/uploads/:filename", async (req, res) => {
     const { filename } = req.params;
+    const localPath = path.join(uploadsDir, filename);
 
+    // 1. Try serving from local disk first
+    if (fs.existsSync(localPath)) {
+      return res.sendFile(localPath);
+    }
+
+    // 2. Fallback to MongoDB
     try {
       if (!db) await connectToMongo();
       if (db) {
         const fileRecord = await db.collection("files").findOne({ filename });
-        if (fileRecord?.driveFileId) {
-          const ok = await streamFromDrive(
-            fileRecord.driveFileId,
-            res,
-            fileRecord.mimeType || "application/octet-stream"
-          );
-          if (ok) return;
+        
+        if (fileRecord && fileRecord.data) {
+          // Cache locally for future requests
+          fs.writeFileSync(localPath, fileRecord.data.buffer);
+          res.contentType(fileRecord.mimeType || 'application/octet-stream');
+          return res.send(fileRecord.data.buffer);
         }
       }
     } catch (error) {
@@ -474,59 +379,28 @@ async function startServer() {
     if (!req.file) return res.status(400).json({ error: "לא נבחר קובץ להעלאה" });
     
     try {
-      const filename = req.file.filename;
-      console.log("[upload] incoming file", {
-        diskStoredPath: req.file.path,
-        diskFilename: req.file.filename,
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        driveFolderId,
-        driveRedirectUriConfigured: !!driveRedirectUri,
-      });
-
-      // Upload to Google Drive only (no MongoDB file storage)
-      const drive = await getDriveClient();
-      if (!drive) {
-        try { fs.unlinkSync(req.file.path); } catch (_) {}
-        return res.status(503).json({
-          error: "Google Drive לא מחובר. לחץ לחיבור.",
-          authUrl: process.env.APP_URL ? `${process.env.APP_URL}/api/drive/auth` : undefined,
-        });
-      }
-
-      const driveFileId: string = await uploadToDrive(
-        req.file.path,
-        req.file.originalname || filename,
-        req.file.mimetype
-      );
-      try { fs.unlinkSync(req.file.path); } catch (_) {}
-
-      console.log("File uploaded to Google Drive:", driveFileId);
-
-      // Save metadata only (driveFileId) - no file binary in MongoDB
+      // Save to MongoDB
       if (db) {
+        const fileBuffer = fs.readFileSync(req.file.path);
         await db.collection("files").updateOne(
-          { filename },
-          {
-            $set: {
-              filename,
+          { filename: req.file.filename },
+          { 
+            $set: { 
+              filename: req.file.filename,
               originalName: req.file.originalname,
               mimeType: req.file.mimetype,
-              driveFileId,
-              uploadedAt: new Date(),
-            },
+              data: fileBuffer,
+              uploadedAt: new Date()
+            } 
           },
           { upsert: true }
         );
       }
 
-      res.json({ path: `/uploads/${filename}` });
+      res.json({ path: `/uploads/${req.file.filename}` });
     } catch (error: any) {
       console.error("Upload error:", error);
-      const gErr = error?.response?.data?.error;
-      const msg = gErr?.message || error?.message || "שגיאה בהעלאה ל-Google Drive";
-      const details = gErr?.errors?.[0]?.message;
-      res.status(500).json({ error: msg, ...(details && { details }) });
+      res.status(500).json({ error: "שגיאה בשמירת הקובץ במסד הנתונים" });
     }
   });
 
@@ -541,7 +415,13 @@ async function startServer() {
       return res.json({ 
         status: "error", 
         message: "Database not connected", 
-        configured: !!process.env.MONGODB_CONNECTION_STRING 
+        configured: !!process.env.MONGODB_CONNECTION_STRING,
+        setupGuide: {
+          step1: "Go to Settings (gear icon) -> Secrets",
+          step2: "Add MONGODB_CONNECTION_STRING with your MongoDB Atlas URI",
+          step3: "Ensure your password is URL-encoded if it contains special characters",
+          step4: "Ensure your IP is whitelisted in MongoDB Atlas (0.0.0.0/0 for testing)"
+        }
       });
     }
     try {
@@ -554,84 +434,6 @@ async function startServer() {
       });
     } catch (error: any) {
       res.status(500).json({ status: "error", message: error.message, configured: true });
-    }
-  });
-
-  // Google Drive OAuth - start authorization
-  app.get("/api/drive/auth", (req, res) => {
-    const oauth2 = createOAuth2Client();
-    if (!oauth2 || !driveFolderId) {
-      return res.status(400).json({
-        error: "Google Drive לא מוגדר",
-        hint: "הגדר GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_DRIVE_FOLDER_ID ב-.env"
-      });
-    }
-    const url = oauth2.generateAuthUrl({
-      access_type: "offline",
-      scope: DRIVE_SCOPES,
-      prompt: "consent",
-    });
-    res.redirect(url);
-  });
-
-  // Google Drive OAuth - callback after user authorizes
-  app.get("/api/drive/callback", async (req, res) => {
-    const { code } = req.query;
-    if (!code || typeof code !== "string") {
-      return res.redirect("/?drive_error=no_code");
-    }
-    try {
-      const oauth2 = createOAuth2Client();
-      if (!oauth2) throw new Error("OAuth not configured");
-      const { tokens } = await oauth2.getToken(code);
-      if (!tokens.refresh_token) throw new Error("No refresh token - try revoking app access and re-authorize");
-      if (!db) await connectToMongo();
-      if (db) {
-        await db.collection("drive_oauth").updateOne(
-          { id: "default" },
-          { $set: { refresh_token: tokens.refresh_token, updated_at: new Date() } },
-          { upsert: true }
-        );
-      }
-      res.redirect("/?drive_connected=1");
-    } catch (e: any) {
-      console.error("Drive OAuth callback error:", e);
-      res.redirect(`/?drive_error=${encodeURIComponent(e?.message || "unknown")}`);
-    }
-  });
-
-  // Google Drive connection test
-  app.get("/api/debug/drive", async (req, res) => {
-    const drive = await getDriveClient();
-    if (!drive) {
-      const hasOAuthConfig = !!driveClientId && !!driveClientSecret;
-      const hasToken = !!(await getStoredRefreshToken());
-      return res.json({
-        status: "error",
-        message: hasOAuthConfig && !hasToken
-          ? "לא מחובר - לחץ לחיבור Google Drive"
-          : "Google Drive not configured",
-        configured: hasOAuthConfig,
-        connected: hasToken,
-        authUrl: hasOAuthConfig && !hasToken && process.env.APP_URL ? `${process.env.APP_URL}/api/drive/auth` : undefined,
-      });
-    }
-    try {
-      const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-      const file = await drive.files.get({ fileId: folderId!, fields: "id,name" });
-      res.json({
-        status: "ok",
-        configured: true,
-        connected: true,
-        folder: { id: file.data.id, name: file.data.name }
-      });
-    } catch (error: any) {
-      res.status(500).json({
-        status: "error",
-        message: error?.message || "Drive API error",
-        configured: true,
-        connected: true,
-      });
     }
   });
 
@@ -1043,7 +845,6 @@ async function startServer() {
     const { field, filePath } = req.body;
 
     try {
-      if (!ai) return res.status(503).json({ error: "GEMINI_API_KEY is not configured. AI extraction is unavailable." });
       if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid ID" });
       
       const absolutePath = await ensureFileOnDisk(filePath);
@@ -1052,10 +853,7 @@ async function startServer() {
       }
 
       const fileBuffer = fs.readFileSync(absolutePath);
-      const base64Data = fileBuffer.toString("base64");
-      if (absolutePath.includes("_tmp_")) {
-        try { fs.unlinkSync(absolutePath); } catch (_) {}
-      }
+      const base64Data = fileBuffer.toString('base64');
       const mimeType = filePath.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg';
 
       let prompt = "";
