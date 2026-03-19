@@ -2034,7 +2034,10 @@ ${statusLink}
     }
 
     const encodedMessage = encodeURIComponent(whatsAppFormData.message);
-    const whatsappUrl = `https://web.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    const whatsappUrl = isMobile 
+      ? `https://api.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`
+      : `https://web.whatsapp.com/send?phone=${phone}&text=${encodedMessage}`;
     
     // Log the action
     try {
